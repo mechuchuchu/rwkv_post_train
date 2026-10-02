@@ -110,11 +110,55 @@ def include_eos_in_assistant_generation(tokenizer) -> None:
         raise ValueError("The RWKV-7 chat template has malformed generation markers.")
 
     assistant_span = template[start.end() : end.start()]
-    if re.search(r"{{-?\s*eos_token\b", assistant_span) or tokenizer.eos_token in assistant_span:
-        return
+    eos_is_inside = bool(
+        re.search(r"\beos_token\b", assistant_span) or tokenizer.eos_token in assistant_span
+    )
 
-    tokenizer.chat_template = template[: end.start()] + "{{ eos_token }}" + template[end.start() :]
-    LOGGER.info("Added the tokenizer EOS token inside the assistant generation span for assistant-only loss.")
+    # Some templates put the assistant EOS immediately after endgeneration, which
+    # renders it correctly but leaves it out of the assistant-only loss mask.
+    assistant_tail_start = end.end()
+    tail = template[assistant_tail_start:]
+    next_branch = re.search(r"{%-?\s*(?:elif|else|endif)\b", tail)
+    assistant_tail = tail[: next_branch.start()] if next_branch else tail
+
+    output_tags = list(re.finditer(r"{{-?[^{}]*?-?}}", assistant_tail))
+    outside_eos = [
+        (match.start(), match.end(), match.group())
+        for match in output_tags
+        if re.search(r"\beos_token\b", match.group()) or tokenizer.eos_token in match.group()
+    ]
+    covered = [(start, end) for start, end, _ in outside_eos]
+    for match in re.finditer(re.escape(tokenizer.eos_token), assistant_tail):
+        if not any(start <= match.start() and match.end() <= end for start, end in covered):
+            outside_eos.append((match.start(), match.end(), match.group()))
+    outside_eos.sort(key=lambda item: item[0])
+
+    if outside_eos:
+        # Remove EOS output from outside the assistant mask. If there is no EOS
+        # inside already, move the existing Jinja expression/literal into it.
+        clean_tail = assistant_tail
+        for outside_start, outside_end, _ in reversed(outside_eos):
+            clean_tail = clean_tail[:outside_start] + clean_tail[outside_end:]
+        template = (
+            template[:assistant_tail_start]
+            + clean_tail
+            + tail[len(assistant_tail) :]
+        )
+        if eos_is_inside:
+            tokenizer.chat_template = template
+            LOGGER.info("Removed a duplicate assistant EOS outside the generation span.")
+            return
+        eos_output = outside_eos[0][2]
+    elif eos_is_inside:
+        return
+    else:
+        eos_output = "{{ eos_token }}"
+
+    tokenizer.chat_template = template[: end.start()] + eos_output + template[end.start() :]
+    if outside_eos:
+        LOGGER.info("Moved the tokenizer EOS token inside the assistant generation span for assistant-only loss.")
+    else:
+        LOGGER.info("Added the tokenizer EOS token inside the assistant generation span for assistant-only loss.")
 
 
 class JsonlMetricsCallback(TrainerCallback):
