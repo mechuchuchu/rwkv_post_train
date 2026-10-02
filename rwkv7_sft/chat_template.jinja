@@ -1,0 +1,56 @@
+{%- set add_generation_prompt = add_generation_prompt | default(false) -%}
+{%- set keep_history_reasoning = keep_history_reasoning | default(true) -%}
+{%- set bos_token = bos_token | default('', true) -%}
+{%- set tools = tools | default([], true) -%}
+{%- set ns = namespace(system_prompt='', last_assistant=-1) -%}
+{%- for message in messages -%}
+    {%- if message.role == 'system' -%}
+        {%- set ns.system_prompt = message.content | trim -%}
+    {%- elif message.role == 'assistant' -%}
+        {%- set ns.last_assistant = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{{- bos_token -}}
+{%- if ns.system_prompt or tools | length > 0 -%}
+{{ 'System: ' ~ ns.system_prompt }}
+{%- if tools | length > 0 -%}
+{%- if ns.system_prompt %}{{ '\n' }}{%- endif -%}
+{{ 'Tools:\n' ~ (tools | tojson) }}
+{{ '\nWhen using a tool, return only a compact JSON function call in a ```json block, like {"name":"calculator","arguments":{"expression":"2+2"}}. The `name` field must be top-level, never inside `arguments`. Do not copy the tool schema into arguments. Otherwise answer normally.' }}
+{%- endif -%}
+{{ eos_token }}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == 'user' -%}
+{{ 'User: ' ~ (message.content | trim) ~ eos_token }}
+{%- elif message.role == 'tool' -%}
+{{ 'User: Function output:\n' ~ (message.content | trim) ~ eos_token }}
+{%- elif message.role == 'assistant' -%}
+{%- set content = message.content | default('', true) | trim -%}
+{%- set reasoning = message.reasoning_content | default('', true) | trim -%}
+{%- if not keep_history_reasoning and loop.index0 != ns.last_assistant -%}
+    {%- set reasoning = '' -%}
+{%- endif -%}
+{{ 'Assistant: <think>' }}
+{%- generation -%}
+{{ reasoning ~ '</think>' }}
+{%- if content -%}{{ ' ' ~ content }}{%- endif -%}
+{%- if message.tool_calls is defined and message.tool_calls | length > 0 -%}
+{%- for tool_call in message.tool_calls -%}
+    {%- if tool_call.function is defined -%}
+        {%- set name = tool_call.function.name | default('') -%}
+        {%- set args = tool_call.function.arguments | default({}, true) -%}
+    {%- else -%}
+        {%- set name = tool_call.name | default('') -%}
+        {%- set args = tool_call.arguments | default({}, true) -%}
+    {%- endif -%}
+{{ '\n```json\n{"name": ' ~ (name | tojson) ~ ', "arguments": ' ~ (args if args is string else (args | tojson)) ~ '}\n```' }}
+{%- endfor -%}
+{%- endif -%}
+{{ eos_token }}
+{%- endgeneration -%}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+{{ 'Assistant: <think>' }}
+{%- endif -%}

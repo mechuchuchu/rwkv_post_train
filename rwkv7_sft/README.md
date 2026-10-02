@@ -1,23 +1,23 @@
 # RWKV-7 SFT example
 
-LoRA SFT example for the local `RWKV7-G1k-1.5B-20260930-bucket` checkpoint and
-[`allenai/Dolci-Think-SFT-32B`](https://huggingface.co/datasets/allenai/Dolci-Think-SFT-32B).
-The dataset uses a conversational `messages` column. The script loads the
-plain-text `chat_template.jinja` from the configured model bucket onto the
-tokenizer before training and saves that tokenizer with the resulting adapter.
-The template emits the last system message and optional tool schemas before the
-dialogue. User messages and tool results end with EOS. Assistant generation spans
-include `reasoning_content`, `</think>`, response text, serialized tool calls, and
-EOS, so `assistant_only_loss` covers the assistant turn and its end marker.
+LoRA SFT for the local `RWKV7-G1k-1.5B-20260930-bucket` checkpoint using the
+chat template from [`Ilikemechuri/rwkv7_quail_1p5b_sft`](https://huggingface.co/Ilikemechuri/rwkv7_quail_1p5b_sft).
+The template is checked in as `chat_template.jinja` and installed on the tokenizer
+before training. User and tool-result turns end with EOS. Assistant turns use
+`reasoning_content` inside the template's `<think>...</think>` span, followed by
+the answer and EOS; `assistant_only_loss` covers that complete assistant turn.
 `keep_history_reasoning` defaults to true; set it to false in
-`chat_template_kwargs` to omit reasoning from earlier assistant turns. Generation
-prompting ends with `Assistant: <think>`.
+`chat_template_kwargs` to omit reasoning from earlier assistant turns.
 
-Rows may contain text-only `system`, `user`, `assistant`, and `tool` messages,
-assistant tool calls, and a JSON-serializable `tools` schema. Rows with malformed
-roles, non-text message fields, invalid tool calls, or no user and assistant
-target are filtered out before formatting, so one unsupported row does not stop
-a streamed run.
+`prepare_data.py` creates `data/rwkv7_quail_sft_300k.jsonl` with 150,000
+conversations from each of
+[`allenai/Dolci-Think-SFT-32B`](https://huggingface.co/datasets/allenai/Dolci-Think-SFT-32B)
+and [`nvidia/Nemotron-Instruction-Following-Chat-v1`](https://huggingface.co/datasets/nvidia/Nemotron-Instruction-Following-Chat-v1).
+It streams the source rows and writes ordinary JSONL without tokenizing. It keeps
+the conversation turns and roles, separates Dolci's leading `<think>...</think>`
+block into `reasoning_content`, preserves Nemotron `reasoning_content`, and adds
+dataset/source IDs for provenance. The output can be passed directly to
+`SFTTrainer` as conversational `messages` rows.
 
 ## Run
 
@@ -27,17 +27,15 @@ Accelerate packages in `/venv/main`. On another environment, install
 
 ```bash
 source /venv/main/bin/activate
-cd /workspace/rwkv7_sft
+cd /workspace/rwkv_post_train/rwkv7_sft
+python prepare_data.py
 python train.py
 ```
 
-By default, the dataset is streamed and shuffled with a 20,000-row buffer. The
-starter run is capped at 1,000 optimizer steps, with a 1,024-token maximum length,
-batch size 1, and gradient accumulation 16. Change those values in `config.json`
-for a larger run. For a local cached dataset instead, set `dataset.streaming` to
-`false`; set `dataset.max_train_samples` to cap the selected rows, or leave it
-`null` to use the full split. This dataset contains about 2.25 million rows, so a
-full local download needs about 36 GB plus cache overhead.
+The prepared dataset is streamed from the local JSONL and shuffled with a
+20,000-row buffer. The starter run is capped at 1,000 optimizer steps, with a
+1,024-token maximum length, batch size 1, and gradient accumulation 16. Change
+those values in `config.json` for a larger run.
 
 ## Resume, logs, and Hub upload
 
@@ -71,7 +69,8 @@ python train.py
 
 `hub.base_model_id` is written into the adapter metadata and should identify the
 Hub repo for the base weights and tokenizer used by this run. `model.path` points
-to the local copy. Change
+to the local copy. `model.chat_template_path` selects the vendored Quail template.
+Change
 `hub.path_in_repo` to choose another folder within the Hub repo. Set
 `hub.private` to `false` only if you want a public repository.
 
@@ -88,14 +87,16 @@ Edit `config.json`:
 - dataset streaming, shuffle buffer, and optional row limit
 - Hub repository, visibility, and upload switch
 
-The default LoRA modules and assistant-only loss follow the RWKV-7 checkpoint's
-SFT example. If packing is enabled, keep `packing_strategy` set to `bfd`; RWKV-7
+The source datasets carry their own attribution terms (ODC-BY-1.0 for Dolci and
+CC BY 4.0 for Nemotron); the prepared rows retain their source metadata. The
+default LoRA modules and assistant-only loss follow the RWKV-7 checkpoint's SFT
+example. If packing is enabled, keep `packing_strategy` set to `bfd`; RWKV-7
 needs sequence reset boundaries preserved. If the fused CUDA WKV kernel is not
 available in a different environment, set `model.wkv_implementation` to
 `chunked` for the portable implementation.
 
 This workspace is not backed by a persistent volume on the current instance.
-Local checkpoints survive a stop/start, but a recycle or destroy removes them;
-copy checkpoints to persistent storage if you need recovery across that event.
-The dataset card lists its license as ODC-BY; review its attribution terms before
-redistributing a trained artifact.
+The prepared dataset and local checkpoints survive a stop/start, but a recycle or
+destroy removes them; copy anything you need to keep to persistent storage.
+Review both source datasets' attribution terms before redistributing a trained
+artifact.

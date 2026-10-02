@@ -1,11 +1,12 @@
 {
   "model": {
     "path": "/workspace/RWKV7-G1k-1.5B-20260930-bucket",
+    "chat_template_path": "./chat_template.jinja",
     "dtype": "bfloat16",
     "wkv_implementation": "cuda"
   },
   "dataset": {
-    "repo_id": "allenai/Dolci-Think-SFT-32B",
+    "path": "./data/rwkv7_quail_sft_300k.jsonl",
     "split": "train",
     "streaming": true,
     "shuffle_buffer_size": 20000,

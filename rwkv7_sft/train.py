@@ -88,11 +88,10 @@ def configure_logging(output_dir: Path) -> Path:
     return logs_dir
 
 
-def configure_chat_template(tokenizer, model_path: Path) -> None:
-    """Load the model bucket's plain-text template and validate its end token."""
+def configure_chat_template(tokenizer, template_path: Path) -> None:
+    """Install the configured plain-text template and validate its end token."""
     if not tokenizer.eos_token:
         raise ValueError("The RWKV-7 tokenizer must define eos_token for the chat template.")
-    template_path = model_path / "chat_template.jinja"
     if not template_path.is_file():
         raise FileNotFoundError(f"RWKV chat template does not exist: {template_path}")
     template = template_path.read_text(encoding="utf-8")
@@ -277,14 +276,40 @@ def valid_chat_example(example: dict[str, Any]) -> bool:
         return False
 
 
-def load_training_dataset(data_config: dict[str, Any], training_config: dict[str, Any]):
+def load_training_dataset(
+    data_config: dict[str, Any],
+    training_config: dict[str, Any],
+    *,
+    config_dir: Path,
+):
     streaming = bool(data_config.get("streaming", True))
-    dataset = load_dataset(
-        data_config["repo_id"],
-        split=data_config.get("split", "train"),
-        streaming=streaming,
-    )
+    split = data_config.get("split", "train")
+    local_path = data_config.get("path")
+    if local_path:
+        dataset_path = resolve_path(local_path, relative_to=config_dir)
+        if not dataset_path.is_file():
+            raise FileNotFoundError(
+                f"Local SFT JSONL does not exist: {dataset_path}. Run prepare_data.py first."
+            )
+        dataset = load_dataset(
+            "json",
+            data_files={split: str(dataset_path)},
+            split=split,
+            streaming=streaming,
+        )
+    else:
+        dataset = load_dataset(
+            data_config["repo_id"],
+            split=split,
+            streaming=streaming,
+        )
     dataset = dataset.filter(valid_chat_example)
+    # The prepared JSONL keeps source IDs alongside the conversations for
+    # provenance. They are not model inputs, so drop them before SFTTrainer's
+    # tokenizer and collator see each row.
+    metadata_columns = [name for name in dataset.column_names if name != "messages"]
+    if metadata_columns:
+        dataset = dataset.remove_columns(metadata_columns)
 
     seed = int(training_config.get("seed", 42))
     max_samples = data_config.get("max_train_samples")
@@ -411,7 +436,11 @@ def main() -> None:
         )
 
     max_steps = int(training_config.get("max_steps", -1))
-    dataset, streaming = load_training_dataset(config["dataset"], training_config)
+    dataset, streaming = load_training_dataset(
+        config["dataset"],
+        training_config,
+        config_dir=config_path.parent,
+    )
     if streaming and max_steps < 1:
         raise ValueError("Streaming datasets require training.max_steps to be a positive integer.")
 
@@ -423,7 +452,13 @@ def main() -> None:
 
     LOGGER.info("Loading RWKV-7 from %s", model_path)
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-    configure_chat_template(tokenizer, model_path)
+    template_value = config["model"].get("chat_template_path")
+    template_path = (
+        resolve_path(template_value, relative_to=config_path.parent)
+        if template_value
+        else model_path / "chat_template.jinja"
+    )
+    configure_chat_template(tokenizer, template_path)
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
         trust_remote_code=True,
