@@ -18,10 +18,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, s
 from transformers.trainer_utils import get_last_checkpoint
 from trl import SFTConfig, SFTTrainer
 
-logging.basicConfig(level=logging.INFO, handlers=[stream_handler, file_handler], force=True)
 
-for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "fsspec", "filelock"):
-    logging.getLogger(noisy).setLevel(logging.WARNING)
 LOGGER = logging.getLogger("rwkv7_sft")
 
 
@@ -86,6 +83,8 @@ def configure_logging(output_dir: Path) -> Path:
     file_handler = logging.FileHandler(log_path, encoding="utf-8")
     file_handler.setFormatter(formatter)
     logging.basicConfig(level=logging.INFO, handlers=[stream_handler, file_handler], force=True)
+    for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "fsspec", "filelock"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     return logs_dir
 
 
