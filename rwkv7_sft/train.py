@@ -454,7 +454,7 @@ def main() -> None:
         run_name=output_dir.name,
         packing=bool(training_config.get("packing", False)),
         packing_strategy=training_config.get("packing_strategy", "bfd"),
-        assistant_only_loss=True,
+        assistant_only_loss=False,
         seed=int(training_config.get("seed", 42)),
         dataloader_num_workers=int(training_config.get("dataloader_num_workers", 0)),
         # Hub uploads use HfApi so all artifacts can be placed under
