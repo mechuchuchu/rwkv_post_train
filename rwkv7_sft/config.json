@@ -14,8 +14,8 @@
   "output_dir": "./runs/dolci-think-rwkv7-1p5b-lora",
   "resume_from_checkpoint": "auto",
   "training": {
-    "max_length": 8912,
-    "max_steps": -1,
+    "max_length": 1024,
+    "max_steps": 1000,
     "num_train_epochs": 1.0,
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 16,

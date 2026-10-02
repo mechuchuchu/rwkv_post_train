@@ -89,23 +89,82 @@ class JsonlMetricsCallback(TrainerCallback):
         return control
 
 
-def valid_chat_example(example: dict[str, Any]) -> bool:
-    messages = example.get("messages")
-    if not isinstance(messages, list):
+def valid_tool_calls(value: Any) -> bool:
+    """Return whether tool calls match the shapes used by the chat template."""
+    if not isinstance(value, list):
         return False
-    has_user = any(
-        isinstance(message, dict)
-        and message.get("role") == "user"
-        and isinstance(message.get("content"), str)
-        for message in messages
-    )
-    has_assistant = any(
-        isinstance(message, dict)
-        and message.get("role") == "assistant"
-        and isinstance(message.get("content"), str)
-        for message in messages
-    )
-    return has_user and has_assistant
+
+    for call in value:
+        if not isinstance(call, dict):
+            return False
+        if "function" in call:
+            function = call["function"]
+            if not isinstance(function, dict):
+                return False
+            name = function.get("name")
+            arguments = function.get("arguments", {})
+        else:
+            name = call.get("name")
+            arguments = call.get("arguments", {})
+
+        if not isinstance(name, str) or not name.strip():
+            return False
+        try:
+            # The template serializes non-string arguments as JSON.
+            json.dumps(arguments)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    return True
+
+
+def valid_chat_example(example: dict[str, Any]) -> bool:
+    """Keep only conversations that the RWKV-7 text/tool template can render."""
+    try:
+        messages = example.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return False
+
+        has_user = False
+        has_assistant_target = False
+        supported_roles = {"system", "user", "assistant", "tool"}
+
+        for message in messages:
+            if not isinstance(message, dict):
+                return False
+
+            role = message.get("role")
+            if not isinstance(role, str) or role not in supported_roles:
+                return False
+
+            content = message.get("content")
+            if role == "assistant":
+                # A tool-call assistant message may omit textual content, but
+                # tool_calls must be a list (not null) for the Jinja template.
+                if "tool_calls" in message:
+                    calls = message["tool_calls"]
+                    if not valid_tool_calls(calls):
+                        return False
+                else:
+                    calls = []
+
+                if content is not None and not isinstance(content, str):
+                    return False
+                if content is None and not calls:
+                    return False
+                has_assistant_target |= bool(content and content.strip()) or bool(calls)
+            else:
+                # The template trims system, user, and tool text directly.
+                if not isinstance(content, str):
+                    return False
+                if role == "user" and content.strip():
+                    has_user = True
+
+        return has_user and has_assistant_target
+    except Exception:
+        # Datasets can contain unexpected nested values. Skip that row instead
+        # of aborting the full streaming pass during filtering.
+        return False
 
 
 def load_training_dataset(data_config: dict[str, Any], training_config: dict[str, Any]):

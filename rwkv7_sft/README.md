@@ -4,7 +4,10 @@ LoRA SFT example for the local `RWKV7-G1k-1.5B-20260930-bucket` checkpoint and
 [`allenai/Dolci-Think-SFT-32B`](https://huggingface.co/datasets/allenai/Dolci-Think-SFT-32B).
 The dataset uses a conversational `messages` column. The script passes those
 messages directly to TRL and applies loss only to assistant turns using the
-RWKV-7 chat template's generation markers.
+RWKV-7 chat template's generation markers. Text conversations may include
+`system`, `user`, `assistant`, and `tool` messages, including assistant tool
+calls. Rows with unsupported roles, non-text content, or malformed tool calls
+are skipped before formatting so one malformed row does not stop a streamed run.
 
 ## Run
 
