@@ -69,8 +69,9 @@ export HF_TOKEN=... # use a write-enabled Hugging Face token
 python train.py
 ```
 
-`hub.base_model_id` is written into the adapter metadata, so update it together
-with `model.path` when switching to a different base checkpoint. Change
+`hub.base_model_id` is written into the adapter metadata and should identify the
+Hub repo for the base weights and tokenizer used by this run. `model.path` points
+to the local copy. Change
 `hub.path_in_repo` to choose another folder within the Hub repo. Set
 `hub.private` to `false` only if you want a public repository.
 
@@ -82,7 +83,7 @@ Edit `config.json`:
 - `training.max_length`, batch size, accumulation, learning rate, gradient
   checkpointing, packing, save frequency, and training steps
 - `lora.enabled`, rank, alpha, dropout, and target modules
-- `hub.base_model_id` when changing the base checkpoint, and `hub.path_in_repo`
+- `hub.base_model_id` for the base model repo, and `hub.path_in_repo`
   to choose the Hub subfolder
 - dataset streaming, shuffle buffer, and optional row limit
 - Hub repository, visibility, and upload switch
