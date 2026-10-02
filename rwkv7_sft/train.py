@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -86,6 +87,34 @@ def configure_logging(output_dir: Path) -> Path:
     for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "fsspec", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     return logs_dir
+
+
+def include_eos_in_assistant_generation(tokenizer) -> None:
+    """Make the assistant EOS token part of the tokenizer's assistant loss mask."""
+    template = tokenizer.chat_template
+    if not isinstance(template, str):
+        raise ValueError("The RWKV-7 tokenizer must provide a single string chat_template.")
+    if tokenizer.eos_token is None:
+        raise ValueError("assistant_only_loss requires an EOS token on the tokenizer.")
+
+    generation_starts = list(re.finditer(r"{%-?\s*generation\s*-?%}", template))
+    generation_ends = list(re.finditer(r"{%-?\s*endgeneration\s*-?%}", template))
+    if len(generation_starts) != 1 or len(generation_ends) != 1:
+        raise ValueError(
+            "Expected one assistant {% generation %}...{% endgeneration %} block in the RWKV-7 chat template."
+        )
+
+    start = generation_starts[0]
+    end = generation_ends[0]
+    if start.end() > end.start():
+        raise ValueError("The RWKV-7 chat template has malformed generation markers.")
+
+    assistant_span = template[start.end() : end.start()]
+    if re.search(r"{{-?\s*eos_token\b", assistant_span) or tokenizer.eos_token in assistant_span:
+        return
+
+    tokenizer.chat_template = template[: end.start()] + "{{ eos_token }}" + template[end.start() :]
+    LOGGER.info("Added the tokenizer EOS token inside the assistant generation span for assistant-only loss.")
 
 
 class JsonlMetricsCallback(TrainerCallback):
@@ -389,6 +418,7 @@ def main() -> None:
 
     LOGGER.info("Loading RWKV-7 from %s", model_path)
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+    include_eos_in_assistant_generation(tokenizer)
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
         trust_remote_code=True,
@@ -454,7 +484,7 @@ def main() -> None:
         run_name=output_dir.name,
         packing=bool(training_config.get("packing", False)),
         packing_strategy=training_config.get("packing_strategy", "bfd"),
-        assistant_only_loss=False,
+        assistant_only_loss=True,
         seed=int(training_config.get("seed", 42)),
         dataloader_num_workers=int(training_config.get("dataloader_num_workers", 0)),
         # Hub uploads use HfApi so all artifacts can be placed under

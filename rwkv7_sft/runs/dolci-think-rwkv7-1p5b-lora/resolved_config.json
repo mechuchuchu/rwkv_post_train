@@ -42,7 +42,12 @@
     "r": 8,
     "alpha": 16,
     "dropout": 0.05,
-    "target_modules": ["receptance", "key", "value", "output"],
+    "target_modules": [
+      "receptance",
+      "key",
+      "value",
+      "output"
+    ],
     "bias": "none"
   },
   "hub": {
