@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -89,76 +88,18 @@ def configure_logging(output_dir: Path) -> Path:
     return logs_dir
 
 
-def include_eos_in_assistant_generation(tokenizer) -> None:
-    """Make the assistant EOS token part of the tokenizer's assistant loss mask."""
-    template = tokenizer.chat_template
-    if not isinstance(template, str):
-        raise ValueError("The RWKV-7 tokenizer must provide a single string chat_template.")
-    if tokenizer.eos_token is None:
-        raise ValueError("assistant_only_loss requires an EOS token on the tokenizer.")
-
-    generation_starts = list(re.finditer(r"{%-?\s*generation\s*-?%}", template))
-    generation_ends = list(re.finditer(r"{%-?\s*endgeneration\s*-?%}", template))
-    if len(generation_starts) != 1 or len(generation_ends) != 1:
-        raise ValueError(
-            "Expected one assistant {% generation %}...{% endgeneration %} block in the RWKV-7 chat template."
-        )
-
-    start = generation_starts[0]
-    end = generation_ends[0]
-    if start.end() > end.start():
-        raise ValueError("The RWKV-7 chat template has malformed generation markers.")
-
-    assistant_span = template[start.end() : end.start()]
-    eos_is_inside = bool(
-        re.search(r"\beos_token\b", assistant_span) or tokenizer.eos_token in assistant_span
-    )
-
-    # Some templates put the assistant EOS immediately after endgeneration, which
-    # renders it correctly but leaves it out of the assistant-only loss mask.
-    assistant_tail_start = end.end()
-    tail = template[assistant_tail_start:]
-    next_branch = re.search(r"{%-?\s*(?:elif|else|endif)\b", tail)
-    assistant_tail = tail[: next_branch.start()] if next_branch else tail
-
-    output_tags = list(re.finditer(r"{{-?[^{}]*?-?}}", assistant_tail))
-    outside_eos = [
-        (match.start(), match.end(), match.group())
-        for match in output_tags
-        if re.search(r"\beos_token\b", match.group()) or tokenizer.eos_token in match.group()
-    ]
-    covered = [(start, end) for start, end, _ in outside_eos]
-    for match in re.finditer(re.escape(tokenizer.eos_token), assistant_tail):
-        if not any(start <= match.start() and match.end() <= end for start, end in covered):
-            outside_eos.append((match.start(), match.end(), match.group()))
-    outside_eos.sort(key=lambda item: item[0])
-
-    if outside_eos:
-        # Remove EOS output from outside the assistant mask. If there is no EOS
-        # inside already, move the existing Jinja expression/literal into it.
-        clean_tail = assistant_tail
-        for outside_start, outside_end, _ in reversed(outside_eos):
-            clean_tail = clean_tail[:outside_start] + clean_tail[outside_end:]
-        template = (
-            template[:assistant_tail_start]
-            + clean_tail
-            + tail[len(assistant_tail) :]
-        )
-        if eos_is_inside:
-            tokenizer.chat_template = template
-            LOGGER.info("Removed a duplicate assistant EOS outside the generation span.")
-            return
-        eos_output = outside_eos[0][2]
-    elif eos_is_inside:
-        return
-    else:
-        eos_output = "{{ eos_token }}"
-
-    tokenizer.chat_template = template[: end.start()] + eos_output + template[end.start() :]
-    if outside_eos:
-        LOGGER.info("Moved the tokenizer EOS token inside the assistant generation span for assistant-only loss.")
-    else:
-        LOGGER.info("Added the tokenizer EOS token inside the assistant generation span for assistant-only loss.")
+def configure_chat_template(tokenizer, model_path: Path) -> None:
+    """Load the model bucket's plain-text template and validate its end token."""
+    if not tokenizer.eos_token:
+        raise ValueError("The RWKV-7 tokenizer must define eos_token for the chat template.")
+    template_path = model_path / "chat_template.jinja"
+    if not template_path.is_file():
+        raise FileNotFoundError(f"RWKV chat template does not exist: {template_path}")
+    template = template_path.read_text(encoding="utf-8")
+    if not template.strip():
+        raise ValueError(f"RWKV chat template is empty: {template_path}")
+    tokenizer.chat_template = template
+    LOGGER.info("Installed the RWKV chat template from %s", template_path)
 
 
 class JsonlMetricsCallback(TrainerCallback):
@@ -239,7 +180,7 @@ class HubUploadCallback(TrainerCallback):
 
 
 def valid_tool_calls(value: Any) -> bool:
-    """Return whether tool calls match the shapes used by the chat template."""
+    """Return whether tool calls can be serialized by the chat template."""
     if not isinstance(value, list):
         return False
 
@@ -259,19 +200,43 @@ def valid_tool_calls(value: Any) -> bool:
         if not isinstance(name, str) or not name.strip():
             return False
         try:
-            # The template serializes non-string arguments as JSON.
-            json.dumps(arguments)
+            if isinstance(arguments, str):
+                json.loads(arguments)
+            else:
+                json.dumps(arguments)
         except (TypeError, ValueError, OverflowError):
             return False
 
     return True
 
 
+def valid_tool_schemas(value: Any) -> bool:
+    """Return whether an optional tool schema can be passed to Jinja."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return False
+    if value is None:
+        return True
+    if not isinstance(value, list):
+        return False
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return True
+
+
 def valid_chat_example(example: dict[str, Any]) -> bool:
-    """Keep only conversations that the RWKV-7 text/tool template can render."""
+    """Keep conversations represented by the configured chat template."""
     try:
         messages = example.get("messages")
         if not isinstance(messages, list) or not messages:
+            return False
+        if not valid_tool_schemas(example.get("tools")):
             return False
 
         has_user = False
@@ -288,29 +253,25 @@ def valid_chat_example(example: dict[str, Any]) -> bool:
 
             content = message.get("content")
             if role == "assistant":
-                # A tool-call assistant message may omit textual content, but
-                # tool_calls must be a list (not null) for the Jinja template.
-                if "tool_calls" in message:
-                    calls = message["tool_calls"]
-                    if not valid_tool_calls(calls):
-                        return False
-                else:
-                    calls = []
-
+                reasoning = message.get("reasoning_content")
                 if content is not None and not isinstance(content, str):
                     return False
-                if content is None and not calls:
+                if reasoning is not None and not isinstance(reasoning, str):
                     return False
-                has_assistant_target |= bool(content and content.strip()) or bool(calls)
-            else:
-                # The template trims system, user, and tool text directly.
-                if not isinstance(content, str):
+                calls = message.get("tool_calls", [])
+                if not valid_tool_calls(calls):
                     return False
-                if role == "user" and content.strip():
-                    has_user = True
+                has_assistant_target |= bool(content and content.strip())
+                has_assistant_target |= bool(reasoning and reasoning.strip())
+                has_assistant_target |= bool(calls)
+            elif not isinstance(content, str):
+                return False
+
+            if role == "user" and content.strip():
+                has_user = True
 
         return has_user and has_assistant_target
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         # Datasets can contain unexpected nested values. Skip that row instead
         # of aborting the full streaming pass during filtering.
         return False
@@ -462,7 +423,7 @@ def main() -> None:
 
     LOGGER.info("Loading RWKV-7 from %s", model_path)
     tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
-    include_eos_in_assistant_generation(tokenizer)
+    configure_chat_template(tokenizer, model_path)
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
         trust_remote_code=True,

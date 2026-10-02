@@ -2,15 +2,22 @@
 
 LoRA SFT example for the local `RWKV7-G1k-1.5B-20260930-bucket` checkpoint and
 [`allenai/Dolci-Think-SFT-32B`](https://huggingface.co/datasets/allenai/Dolci-Think-SFT-32B).
-The dataset uses a conversational `messages` column. The script passes those
-messages directly to TRL and applies loss only to assistant turns using the
-RWKV-7 chat template's generation markers. It ensures the tokenizer's EOS token
-is inside that assistant span, moving it there if the template puts it outside,
-so assistant-only loss also trains the model to end each turn. Text
-conversations may include
-`system`, `user`, `assistant`, and `tool` messages, including assistant tool
-calls. Rows with unsupported roles, non-text content, or malformed tool calls
-are skipped before formatting so one malformed row does not stop a streamed run.
+The dataset uses a conversational `messages` column. The script loads the
+plain-text `chat_template.jinja` from the configured model bucket onto the
+tokenizer before training and saves that tokenizer with the resulting adapter.
+The template emits the last system message and optional tool schemas before the
+dialogue. User messages and tool results end with EOS. Assistant generation spans
+include `reasoning_content`, `</think>`, response text, serialized tool calls, and
+EOS, so `assistant_only_loss` covers the assistant turn and its end marker.
+`keep_history_reasoning` defaults to true; set it to false in
+`chat_template_kwargs` to omit reasoning from earlier assistant turns. Generation
+prompting ends with `Assistant: <think>`.
+
+Rows may contain text-only `system`, `user`, `assistant`, and `tool` messages,
+assistant tool calls, and a JSON-serializable `tools` schema. Rows with malformed
+roles, non-text message fields, invalid tool calls, or no user and assistant
+target are filtered out before formatting, so one unsupported row does not stop
+a streamed run.
 
 ## Run
 
