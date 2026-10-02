@@ -32,8 +32,9 @@ full local download needs about 36 GB plus cache overhead.
 ## Resume, logs, and Hub upload
 
 `resume_from_checkpoint: "auto"` first resumes from the newest local
-`output_dir/checkpoint-*` directory, then falls back to `last-checkpoint/` on the
-configured Hub repo. To choose explicitly:
+`output_dir/checkpoint-*` directory, then falls back to
+`<hub.path_in_repo>/last-checkpoint/` on the configured Hub repo. To choose
+explicitly:
 
 ```bash
 python train.py --resume-from-checkpoint /path/to/checkpoint-500
@@ -42,15 +43,16 @@ python train.py --resume-from-checkpoint none
 
 Checkpoints are saved every 500 optimizer steps by default, and the newest three
 are retained locally. With the configured `hub_strategy: "checkpoint"`, each
-save also uploads the latest adapter plus a resumable training checkpoint under
-`last-checkpoint/` in the Hub repository. `logs/run.log` stores readable logs; `logs/metrics.jsonl` stores
-step, epoch, loss, learning rate, and other Trainer metrics. The final adapter,
-tokenizer, training metrics, and Trainer state are saved in the run directory.
+save uploads the latest adapter to `<hub.path_in_repo>/` and a resumable training
+checkpoint to `<hub.path_in_repo>/last-checkpoint/` in the Hub repository. These
+uploads run synchronously at each save. `logs/run.log` stores readable logs;
+`logs/metrics.jsonl` stores step, epoch, loss, learning rate, and other Trainer
+metrics. The final adapter, tokenizer, training metrics, and Trainer state are
+saved in the run directory.
 
-The example is configured to push to
-`Ilikemechuri/rwkv7-g1k-1.5B-lora-dolci` every 500 optimizer steps and at the
-end. The repo is private by default. Provide a Hugging Face token with write
-access before starting:
+The example pushes to the `Ilikemechuri/rwkv7-g1k-1.5B-lora-dolci` model repo,
+under the `rwkv7_g1k_lora_dolci/` folder. The repo is private by default. Provide
+a Hugging Face token with write access before starting:
 
 ```bash
 export HF_TOKEN=... # use a write-enabled Hugging Face token
@@ -58,11 +60,9 @@ python train.py
 ```
 
 `hub.base_model_id` is written into the adapter metadata, so update it together
-with `model.path` when switching to a different base checkpoint. Set
-`hub.private` to `false` only if you want a public repository. Keep
-`hub.hub_always_push` false to avoid starting another upload while a previous
-checkpoint upload is still running; missed intermediate upload attempts are
-covered by the next save.
+with `model.path` when switching to a different base checkpoint. Change
+`hub.path_in_repo` to choose another folder within the Hub repo. Set
+`hub.private` to `false` only if you want a public repository.
 
 ## Settings to tune
 
@@ -72,7 +72,8 @@ Edit `config.json`:
 - `training.max_length`, batch size, accumulation, learning rate, gradient
   checkpointing, packing, save frequency, and training steps
 - `lora.enabled`, rank, alpha, dropout, and target modules
-- `hub.base_model_id` when changing the base checkpoint
+- `hub.base_model_id` when changing the base checkpoint, and `hub.path_in_repo`
+  to choose the Hub subfolder
 - dataset streaming, shuffle buffer, and optional row limit
 - Hub repository, visibility, and upload switch
 

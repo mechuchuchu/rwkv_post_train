@@ -55,6 +55,24 @@ def resolve_path(value: str, *, relative_to: Path) -> Path:
     return path
 
 
+def normalize_hub_path(value: Any) -> str:
+    """Normalize and validate a repository-relative Hub subdirectory."""
+    if value is None or value == "":
+        return ""
+    if not isinstance(value, str):
+        raise ValueError("hub.path_in_repo must be a string")
+
+    path = value.strip("/")
+    parts = path.split("/")
+    if not path or "\\" in path or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError(f"Invalid Hub path_in_repo: {value!r}")
+    return path
+
+
+def join_hub_path(*parts: str) -> str:
+    return "/".join(part.strip("/") for part in parts if part and part.strip("/"))
+
+
 def configure_logging(output_dir: Path) -> Path:
     logs_dir = output_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -86,6 +104,62 @@ class JsonlMetricsCallback(TrainerCallback):
         with self.metrics_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
             f.flush()
+        return control
+
+
+class HubUploadCallback(TrainerCallback):
+    """Upload model files and optional resumable checkpoints under a Hub path."""
+
+    MODEL_FILE_PATTERNS = [
+        "adapter_config.json",
+        "adapter_model.*",
+        "adapter_model-*.safetensors",
+        "config.json",
+        "generation_config.json",
+        "model*.safetensors",
+        "model*.json",
+        "pytorch_model*.bin",
+        "pytorch_model*.safetensors",
+        "pytorch_model*.json",
+    ]
+
+    def __init__(self, api, repo_id: str, path_in_repo: str, *, upload_checkpoint: bool):
+        self.api = api
+        self.repo_id = repo_id
+        self.path_in_repo = path_in_repo
+        self.upload_checkpoint = upload_checkpoint
+
+    def on_save(self, args, state, control, **kwargs):
+        if not state.is_world_process_zero:
+            return control
+
+        checkpoint_dir = Path(args.output_dir) / f"checkpoint-{state.global_step}"
+        if not checkpoint_dir.is_dir():
+            LOGGER.warning("Checkpoint directory is missing; skipping Hub upload: %s", checkpoint_dir)
+            return control
+
+        model_path = self.path_in_repo or "."
+        LOGGER.info("Uploading latest model files to Hub path %s", model_path)
+        self.api.upload_folder(
+            folder_path=checkpoint_dir,
+            path_in_repo=self.path_in_repo or None,
+            repo_id=self.repo_id,
+            repo_type="model",
+            allow_patterns=self.MODEL_FILE_PATTERNS,
+            commit_message=f"Upload model at step {state.global_step}",
+        )
+
+        if self.upload_checkpoint:
+            checkpoint_path = join_hub_path(self.path_in_repo, "last-checkpoint")
+            LOGGER.info("Uploading resumable checkpoint to Hub path %s", checkpoint_path)
+            self.api.upload_folder(
+                folder_path=checkpoint_dir,
+                path_in_repo=checkpoint_path,
+                repo_id=self.repo_id,
+                repo_type="model",
+                commit_message=f"Upload resumable checkpoint at step {state.global_step}",
+            )
+
         return control
 
 
@@ -198,6 +272,8 @@ def find_resume_checkpoint(
     output_dir: Path,
     requested: str | None,
     hub_config: dict[str, Any],
+    hub_path_in_repo: str,
+    hub_token: str | None,
 ) -> str | None:
     value = requested or "auto"
     if value.lower() in {"none", "false", "off"}:
@@ -213,22 +289,33 @@ def find_resume_checkpoint(
             from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
 
             LOGGER.info("No local checkpoint found; looking for the latest Hub checkpoint.")
+            remote_checkpoint_path = join_hub_path(hub_path_in_repo, "last-checkpoint")
+            allow_patterns = [f"{remote_checkpoint_path}/*"]
+            # Backward compatibility with checkpoints uploaded by the previous
+            # root-level Trainer Hub integration.
+            if hub_path_in_repo:
+                allow_patterns.append("last-checkpoint/*")
             try:
                 snapshot_dir = Path(
                     snapshot_download(
                         repo_id=hub_config["repo_id"],
                         repo_type="model",
-                        allow_patterns=["last-checkpoint/*"],
+                        allow_patterns=allow_patterns,
+                        token=hub_token,
                     )
                 )
             except (EntryNotFoundError, RepositoryNotFoundError):
                 snapshot_dir = None
 
             if snapshot_dir is not None:
-                hub_checkpoint = snapshot_dir / "last-checkpoint"
-                if (hub_checkpoint / "trainer_state.json").is_file():
-                    LOGGER.info("Resuming from Hub checkpoint: %s", hub_checkpoint)
-                    return str(hub_checkpoint)
+                candidates = [remote_checkpoint_path]
+                if hub_path_in_repo:
+                    candidates.append("last-checkpoint")
+                for candidate in candidates:
+                    hub_checkpoint = snapshot_dir.joinpath(*candidate.split("/"))
+                    if (hub_checkpoint / "trainer_state.json").is_file():
+                        LOGGER.info("Resuming from Hub checkpoint: %s", hub_checkpoint)
+                        return str(hub_checkpoint)
 
         LOGGER.info("No local or Hub checkpoint found under %s; starting a new run.", output_dir)
         return None
@@ -257,16 +344,35 @@ def main() -> None:
         raise FileNotFoundError(f"Model path does not exist: {model_path}")
 
     training_config = config["training"]
-    requested_resume = cli.resume_from_checkpoint or config.get("resume_from_checkpoint", "auto")
-    resume_checkpoint = find_resume_checkpoint(output_dir, requested_resume, config["hub"])
-
-    if config["hub"].get("push_to_hub"):
-        if not config["hub"].get("repo_id") or "your-hf-user" in config["hub"]["repo_id"]:
+    hub_config = config["hub"]
+    hub_path_in_repo = normalize_hub_path(hub_config.get("path_in_repo", ""))
+    hub_api = None
+    hub_token = None
+    if hub_config.get("push_to_hub"):
+        if not hub_config.get("repo_id") or "your-hf-user" in hub_config["repo_id"]:
             raise ValueError("Set hub.repo_id to your Hugging Face username/repository before enabling push_to_hub.")
-        from huggingface_hub import get_token
+        from huggingface_hub import HfApi, get_token
 
-        if not get_token():
+        hub_token = get_token()
+        if not hub_token:
             raise RuntimeError("Hub upload is enabled, but no Hugging Face token is available. Set HF_TOKEN first.")
+        hub_api = HfApi(token=hub_token)
+
+    requested_resume = cli.resume_from_checkpoint or config.get("resume_from_checkpoint", "auto")
+    resume_checkpoint = find_resume_checkpoint(
+        output_dir,
+        requested_resume,
+        hub_config,
+        hub_path_in_repo,
+        hub_token,
+    )
+    if hub_api is not None:
+        hub_api.create_repo(
+            repo_id=hub_config["repo_id"],
+            repo_type="model",
+            private=bool(hub_config.get("private", True)),
+            exist_ok=True,
+        )
 
     max_steps = int(training_config.get("max_steps", -1))
     dataset, streaming = load_training_dataset(config["dataset"], training_config)
@@ -304,7 +410,21 @@ def main() -> None:
             bias=config["lora"].get("bias", "none"),
         )
 
-    hub_config = config["hub"]
+    hub_strategy = hub_config.get("hub_strategy", "checkpoint")
+    if hub_api is not None and hub_strategy not in {"checkpoint", "every_save", "end"}:
+        raise ValueError("hub.hub_strategy must be 'checkpoint', 'every_save', or 'end'.")
+
+    callbacks = [JsonlMetricsCallback(logs_dir / "metrics.jsonl")]
+    if hub_api is not None and hub_strategy != "end":
+        callbacks.append(
+            HubUploadCallback(
+                hub_api,
+                hub_config["repo_id"],
+                hub_path_in_repo,
+                upload_checkpoint=hub_strategy == "checkpoint",
+            )
+        )
+
     args = SFTConfig(
         output_dir=str(output_dir),
         max_length=int(training_config.get("max_length", 1024)),
@@ -335,11 +455,9 @@ def main() -> None:
         assistant_only_loss=True,
         seed=int(training_config.get("seed", 42)),
         dataloader_num_workers=int(training_config.get("dataloader_num_workers", 0)),
-        push_to_hub=bool(hub_config.get("push_to_hub", False)),
-        hub_model_id=hub_config.get("repo_id") if hub_config.get("push_to_hub") else None,
-        hub_private_repo=bool(hub_config.get("private", True)),
-        hub_strategy=hub_config.get("hub_strategy", "checkpoint"),
-        hub_always_push=bool(hub_config.get("hub_always_push", False)),
+        # Hub uploads use HfApi so all artifacts can be placed under
+        # hub.path_in_repo instead of Trainer's repository-root layout.
+        push_to_hub=False,
     )
 
     trainer = SFTTrainer(
@@ -348,7 +466,7 @@ def main() -> None:
         train_dataset=dataset,
         processing_class=tokenizer,
         peft_config=lora_config,
-        callbacks=[JsonlMetricsCallback(logs_dir / "metrics.jsonl")],
+        callbacks=callbacks,
     )
 
     train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
@@ -358,13 +476,16 @@ def main() -> None:
     trainer.save_metrics("train", train_result.metrics)
     trainer.save_state()
 
-    if hub_config.get("push_to_hub"):
-        from huggingface_hub import get_token
-
-        LOGGER.info("Uploading final model and run artifacts to %s", hub_config["repo_id"])
-        trainer.push_to_hub(
+    if hub_api is not None:
+        destination = hub_path_in_repo or "."
+        LOGGER.info("Uploading final model and run artifacts to %s:%s", hub_config["repo_id"], destination)
+        hub_api.upload_folder(
+            folder_path=output_dir,
+            path_in_repo=hub_path_in_repo or None,
+            repo_id=hub_config["repo_id"],
+            repo_type="model",
+            ignore_patterns=["checkpoint-*", "logs/**"],
             commit_message="Upload final RWKV-7 Dolci Think SFT adapter",
-            token=get_token(),
         )
 
     LOGGER.info("Training finished. Model/checkpoints: %s", output_dir)
