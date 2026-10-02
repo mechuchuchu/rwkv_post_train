@@ -1,0 +1,17 @@
+# Training outputs: checkpoints, logs, metrics, and resolved configs
+runs/
+logs/
+*.log
+*.jsonl
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local environment and secrets
+.venv/
+venv/
+.env
+.env.*
+!.env.example
