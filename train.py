@@ -1,0 +1,316 @@
+#!/usr/bin/env python3
+"""LoRA SFT for a local RWKV-7 checkpoint on Dolci-Think-SFT-32B."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import torch
+from datasets import load_dataset
+from peft import LoraConfig, TaskType
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback, set_seed
+from transformers.trainer_utils import get_last_checkpoint
+from trl import SFTConfig, SFTTrainer
+
+
+LOGGER = logging.getLogger("rwkv7_sft")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).with_name("config.json"),
+        help="JSON configuration file (default: config.json next to this script).",
+    )
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default=None,
+        help="Override config: 'auto', 'none', or a checkpoint directory.",
+    )
+    return parser.parse_args()
+
+
+def load_config(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as f:
+        config = json.load(f)
+    required = {"model", "dataset", "output_dir", "training", "lora", "hub"}
+    missing = required.difference(config)
+    if missing:
+        raise ValueError(f"Missing top-level config keys: {sorted(missing)}")
+    return config
+
+
+def resolve_path(value: str, *, relative_to: Path) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = (relative_to / path).resolve()
+    return path
+
+
+def configure_logging(output_dir: Path) -> Path:
+    logs_dir = output_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_path = logs_dir / "run.log"
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logging.basicConfig(level=logging.INFO, handlers=[stream_handler, file_handler], force=True)
+    return logs_dir
+
+
+class JsonlMetricsCallback(TrainerCallback):
+    """Append every Trainer metrics event to logs/metrics.jsonl."""
+
+    def __init__(self, metrics_path: Path):
+        self.metrics_path = metrics_path
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not state.is_world_process_zero or not logs:
+            return control
+        record = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "step": state.global_step,
+            "epoch": state.epoch,
+            **logs,
+        }
+        with self.metrics_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
+            f.flush()
+        return control
+
+
+def valid_chat_example(example: dict[str, Any]) -> bool:
+    messages = example.get("messages")
+    if not isinstance(messages, list):
+        return False
+    has_user = any(
+        isinstance(message, dict)
+        and message.get("role") == "user"
+        and isinstance(message.get("content"), str)
+        for message in messages
+    )
+    has_assistant = any(
+        isinstance(message, dict)
+        and message.get("role") == "assistant"
+        and isinstance(message.get("content"), str)
+        for message in messages
+    )
+    return has_user and has_assistant
+
+
+def load_training_dataset(data_config: dict[str, Any], training_config: dict[str, Any]):
+    streaming = bool(data_config.get("streaming", True))
+    dataset = load_dataset(
+        data_config["repo_id"],
+        split=data_config.get("split", "train"),
+        streaming=streaming,
+    )
+    dataset = dataset.filter(valid_chat_example)
+
+    seed = int(training_config.get("seed", 42))
+    max_samples = data_config.get("max_train_samples")
+    if streaming:
+        dataset = dataset.shuffle(
+            seed=seed,
+            buffer_size=int(data_config.get("shuffle_buffer_size", 20_000)),
+        )
+        if max_samples is not None:
+            dataset = dataset.take(int(max_samples))
+    else:
+        dataset = dataset.shuffle(seed=seed)
+        if max_samples is not None:
+            count = min(int(max_samples), len(dataset))
+            dataset = dataset.select(range(count))
+
+    return dataset, streaming
+
+
+def find_resume_checkpoint(
+    output_dir: Path,
+    requested: str | None,
+    hub_config: dict[str, Any],
+) -> str | None:
+    value = requested or "auto"
+    if value.lower() in {"none", "false", "off"}:
+        return None
+    if value.lower() == "auto":
+        checkpoint = get_last_checkpoint(str(output_dir))
+        if checkpoint:
+            LOGGER.info("Resuming from latest checkpoint: %s", checkpoint)
+            return checkpoint
+
+        if hub_config.get("push_to_hub") and hub_config.get("repo_id"):
+            from huggingface_hub import snapshot_download
+            from huggingface_hub.errors import EntryNotFoundError, RepositoryNotFoundError
+
+            LOGGER.info("No local checkpoint found; looking for the latest Hub checkpoint.")
+            try:
+                snapshot_dir = Path(
+                    snapshot_download(
+                        repo_id=hub_config["repo_id"],
+                        repo_type="model",
+                        allow_patterns=["last-checkpoint/*"],
+                    )
+                )
+            except (EntryNotFoundError, RepositoryNotFoundError):
+                snapshot_dir = None
+
+            if snapshot_dir is not None:
+                hub_checkpoint = snapshot_dir / "last-checkpoint"
+                if (hub_checkpoint / "trainer_state.json").is_file():
+                    LOGGER.info("Resuming from Hub checkpoint: %s", hub_checkpoint)
+                    return str(hub_checkpoint)
+
+        LOGGER.info("No local or Hub checkpoint found under %s; starting a new run.", output_dir)
+        return None
+    checkpoint_path = Path(value).expanduser().resolve()
+    if not checkpoint_path.is_dir():
+        raise FileNotFoundError(f"Checkpoint directory does not exist: {checkpoint_path}")
+    return str(checkpoint_path)
+
+
+def main() -> None:
+    cli = parse_args()
+    config_path = cli.config.expanduser().resolve()
+    config = load_config(config_path)
+
+    output_dir = resolve_path(config["output_dir"], relative_to=config_path.parent)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logs_dir = configure_logging(output_dir)
+
+    resolved_config_path = output_dir / "resolved_config.json"
+    with resolved_config_path.open("w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    model_path = resolve_path(config["model"]["path"], relative_to=config_path.parent)
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+
+    training_config = config["training"]
+    requested_resume = cli.resume_from_checkpoint or config.get("resume_from_checkpoint", "auto")
+    resume_checkpoint = find_resume_checkpoint(output_dir, requested_resume, config["hub"])
+
+    if config["hub"].get("push_to_hub"):
+        if not config["hub"].get("repo_id") or "your-hf-user" in config["hub"]["repo_id"]:
+            raise ValueError("Set hub.repo_id to your Hugging Face username/repository before enabling push_to_hub.")
+        from huggingface_hub import get_token
+
+        if not get_token():
+            raise RuntimeError("Hub upload is enabled, but no Hugging Face token is available. Set HF_TOKEN first.")
+
+    max_steps = int(training_config.get("max_steps", -1))
+    dataset, streaming = load_training_dataset(config["dataset"], training_config)
+    if streaming and max_steps < 1:
+        raise ValueError("Streaming datasets require training.max_steps to be a positive integer.")
+
+    set_seed(int(training_config.get("seed", 42)))
+    dtype_name = config["model"].get("dtype", "bfloat16")
+    dtype_by_name = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
+    if dtype_name not in dtype_by_name:
+        raise ValueError(f"Unsupported model dtype {dtype_name!r}; choose from {sorted(dtype_by_name)}")
+
+    LOGGER.info("Loading RWKV-7 from %s", model_path)
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_path),
+        trust_remote_code=True,
+        dtype=dtype_by_name[dtype_name],
+    )
+    # PEFT records this value in adapter_config.json. Keep it as a Hub model ID
+    # even though the weights were loaded from the local workspace.
+    model.name_or_path = config["hub"].get("base_model_id", str(model_path))
+    model.config.use_cache = bool(training_config.get("use_cache", False))
+    if "wkv_implementation" in config["model"]:
+        model.config.wkv_implementation = config["model"]["wkv_implementation"]
+
+    lora_config = None
+    if config["lora"].get("enabled", True):
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=int(config["lora"].get("r", 8)),
+            lora_alpha=int(config["lora"].get("alpha", 16)),
+            lora_dropout=float(config["lora"].get("dropout", 0.05)),
+            target_modules=list(config["lora"].get("target_modules", ["receptance", "key", "value", "output"])),
+            bias=config["lora"].get("bias", "none"),
+        )
+
+    hub_config = config["hub"]
+    args = SFTConfig(
+        output_dir=str(output_dir),
+        max_length=int(training_config.get("max_length", 1024)),
+        max_steps=max_steps,
+        num_train_epochs=float(training_config.get("num_train_epochs", 1.0)),
+        per_device_train_batch_size=int(training_config.get("per_device_train_batch_size", 1)),
+        gradient_accumulation_steps=int(training_config.get("gradient_accumulation_steps", 16)),
+        learning_rate=float(training_config.get("learning_rate", 2e-4)),
+        weight_decay=float(training_config.get("weight_decay", 0.0)),
+        warmup_steps=int(training_config.get("warmup_steps", 50)),
+        lr_scheduler_type=training_config.get("lr_scheduler_type", "cosine"),
+        optim=training_config.get("optim", "adamw_torch"),
+        bf16=bool(training_config.get("bf16", True)),
+        fp16=bool(training_config.get("fp16", False)),
+        gradient_checkpointing=bool(training_config.get("gradient_checkpointing", True)),
+        use_cache=bool(training_config.get("use_cache", False)),
+        max_grad_norm=float(training_config.get("max_grad_norm", 1.0)),
+        logging_strategy="steps",
+        logging_steps=int(training_config.get("logging_steps", 10)),
+        logging_first_step=True,
+        save_strategy="steps",
+        save_steps=int(training_config.get("save_steps", 100)),
+        save_total_limit=int(training_config.get("save_total_limit", 3)),
+        report_to="none",
+        run_name=output_dir.name,
+        packing=bool(training_config.get("packing", False)),
+        packing_strategy=training_config.get("packing_strategy", "bfd"),
+        assistant_only_loss=True,
+        seed=int(training_config.get("seed", 42)),
+        dataloader_num_workers=int(training_config.get("dataloader_num_workers", 0)),
+        push_to_hub=bool(hub_config.get("push_to_hub", False)),
+        hub_model_id=hub_config.get("repo_id") if hub_config.get("push_to_hub") else None,
+        hub_private_repo=bool(hub_config.get("private", True)),
+        hub_strategy=hub_config.get("hub_strategy", "checkpoint"),
+        hub_always_push=bool(hub_config.get("hub_always_push", False)),
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=args,
+        train_dataset=dataset,
+        processing_class=tokenizer,
+        peft_config=lora_config,
+        callbacks=[JsonlMetricsCallback(logs_dir / "metrics.jsonl")],
+    )
+
+    train_result = trainer.train(resume_from_checkpoint=resume_checkpoint)
+    trainer.save_model(str(output_dir))
+    tokenizer.save_pretrained(output_dir)
+    trainer.log_metrics("train", train_result.metrics)
+    trainer.save_metrics("train", train_result.metrics)
+    trainer.save_state()
+
+    if hub_config.get("push_to_hub"):
+        from huggingface_hub import get_token
+
+        LOGGER.info("Uploading final model and run artifacts to %s", hub_config["repo_id"])
+        trainer.push_to_hub(
+            commit_message="Upload final RWKV-7 Dolci Think SFT adapter",
+            token=get_token(),
+        )
+
+    LOGGER.info("Training finished. Model/checkpoints: %s", output_dir)
+    LOGGER.info("Logs: %s", logs_dir)
+
+
+if __name__ == "__main__":
+    main()
